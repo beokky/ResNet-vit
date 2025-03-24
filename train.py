@@ -31,13 +31,47 @@ import numpy as np  # NumPy库，用于数值计算
 import time  # Python中的时间相关功能
 import random  # Python中的随机数生成器
 
+# 新增：用于计算 FLOPs 和 Params
+from fvcore.nn import FlopCountAnalysis, flop_count_table
+from torchsummary import summary
+
+# 自定义工具类（假设已定义）
+class AverageMeter:
+    """Computes and stores the average and current value"""
+    def __init__(self):
+        self.reset()
+    def reset(self):
+        self.val = 0
+        self.avg = 0
+        self.sum = 0
+        self.count = 0
+    def update(self, val, n=1):
+        self.val = val
+        self.sum += val * n
+        self.count += n
+        self.avg = self.sum / self.count
+
+def accuracy(output, target, topk=(1,)):
+    """Computes the accuracy over the k top predictions"""
+    with torch.no_grad():
+        maxk = max(topk)
+        batch_size = target.size(0)
+        _, pred = output.topk(maxk, 1, True, True)
+        pred = pred.t()
+        correct = pred.eq(target.view(1, -1).expand_as(pred))
+        res = []
+        for k in topk:
+            correct_k = correct[:k].reshape(-1).float().sum(0, keepdim=True)
+            res.append(correct_k.mul_(100.0 / batch_size))
+        return res
+
 parser = argparse.ArgumentParser() # 导入argparse模块，用于解析命令行参数
-parser.add_argument("--model_names", type=str, default="vit_base_patch16_224") # 添加命令行参数，指定模型名称，默认为"resnet18"
+parser.add_argument("--model_names", type=str, default="resnet18") # 添加命令行参数，指定模型名称，默认为"resnet18"
 parser.add_argument("--pre_trained", type=bool, default=True) #指定是否使用预训练模型，默认为False
 parser.add_argument("--classes_num", type=int, default=120) # 指定类别数，默认为120
 parser.add_argument("--dataset", type=str, default="dataset") # 指定数据集名称，默认为"dataset"
 parser.add_argument("--batch_size", type=int, default=64) #   指定批量大小，默认为64
-parser.add_argument("--epoch", type=int, default=10) #  指定训练轮次数，默认为20
+parser.add_argument("--epoch", type=int, default=1) #  指定训练轮次数，默认为20
 parser.add_argument("--lr", type=float, default=0.01) #  指定学习率，默认为0.01
 parser.add_argument("--momentum", type=float, default=0.9)  # 优化器的动量，默认为 0.9
 parser.add_argument("--weight-decay", type=float, default=1e-4)  # 权重衰减（正则化项），默认为 5e-4
@@ -45,8 +79,11 @@ parser.add_argument("--seed", type=int, default=33) # 指定随机种子，默�
 parser.add_argument("--gpu-id", type=int, default=0) # 指定GPU编号，默认为0
 parser.add_argument("--print_freq", type=int, default=1)  # 打印训练信息的频率，默认为 1（每个轮次打印一次）
 parser.add_argument("--exp_postfix", type=str, default="logs")  # 实验结果文件夹的后缀，默认为 "logs"
-parser.add_argument("--txt_name", type=str, default="train_data")  # 文本文件名称
+parser.add_argument("--txt_name", type=str, default="train_data")  # 记录训练过程文件名
 
+parser.add_argument("--report_path", type=str, default="report")  # 记录训练过程文件的地址
+parser.add_argument("--model_pth_path", type=str, default="model_pth")  # 最佳模型参数存放地址
+parser.add_argument("--runs_path", type=str, default="runs")  # logs地址
 
 args = parser.parse_args()
 
@@ -63,7 +100,7 @@ seed_torch(seed=args.seed)
 os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu_id) # 设置环境变量 CUDA_VISIBLE_DEVICES，指定可见的 GPU 设备，仅在需要时使用特定的 GPU 设备进行训练
 
 exp_name = args.exp_postfix  # 从命令行参数中获取实验名称后缀,默认为 "logs"
-exp_path = "./report/{}".format(args.model_names)  # 创建用于记录训练过程的路径
+exp_path = "{}/{}".format(args.report_path,args.model_names)  # 创建用于记录训练过程的路径
 os.makedirs(exp_path, exist_ok=True)
 
 # dataloader
@@ -136,35 +173,56 @@ def train_one_epoch(model, optimizer, train_loader):
 
     return losses, acces  # 返回平均损失和平均精度
 
-def evaluation(model, test_loader):
+def evaluation(model, test_loader,topk=(1,)):
     # 将模型设置为评估模式，不会进行参数更新
     model.eval()
-    acc_recorder = AverageMeter()  # 初始化两个计量器，用于记录准确度和损失
     loss_recorder = AverageMeter()
+    acc_recorder = [AverageMeter() for _ in topk]
 
     with torch.no_grad():
         for img, label in tqdm(test_loader, desc="Evaluating"):
-            # for img, label in test_loader:   # 迭代测试数据加载器中的每个批次
             if torch.cuda.is_available():
-                img = img.cuda()
-                label = label.cuda()
+                img, label = img.cuda(), label.cuda()
 
             out = model(img)
-            acc = accuracy(out, label)[0]  # 计算准确度和损失
-            loss = F.cross_entropy(out, label) # 计算交叉熵损失
-            acc_recorder.update(acc.item(), img.size(0))  # 更新准确率记录器，记录当前批次的准确率  img.size(0)表示批次中的样本数量
-            loss_recorder.update(loss.item(), img.size(0))  # 更新损失记录器，记录当前批次的损失
+            loss = F.cross_entropy(out, label)
+            loss_recorder.update(loss.item(), img.size(0))
+
+            acc = accuracy(out, label, topk=topk)
+            for i, a in enumerate(acc):
+                acc_recorder[i].update(a.item(), img.size(0))
+
     losses = loss_recorder.avg # 计算所有批次的平均损失
-    acces = acc_recorder.avg # 计算所有批次的平均准确率
+    acces = [meter.avg for meter in acc_recorder]   # 计算所有批次的平均准确率
     return losses, acces # 返回平均损失和准确率
 
 def train(model, optimizer, train_loader, test_loader, scheduler):
     since = time.time()  # 记录训练开始时间
     best_acc = -1  # 初始化最佳准确度为-1，以便跟踪最佳模型
-    best_model_path = os.path.join('model_pth', args.model_names, "best.pth")
+    best_top5_acc=-1
+    best_model_path = os.path.join(args.model_pth_path, args.model_names, "best.pth")
+
+    # 新增：计算 FLOPs 和 Params
+    if torch.cuda.is_available():
+        dummy_input = torch.rand(1, 3, 224, 224).cuda()
+    else:
+        dummy_input = torch.rand(1, 3, 224, 224)
+    flops = FlopCountAnalysis(model, dummy_input)
+    total_flops = flops.total()
+    total_params = sum(p.numel() for p in model.parameters())
+
+    print(f"Model: {args.model_names}")
+    print(f"Params: {total_params / 1e6:.2f}M")
+    print(f"FLOPs: {total_flops / 1e9:.2f}G")
+    print("--------------------------------------")
+
 
     # 写入训练过程信息
     f = open(os.path.join(exp_path, "{}.txt".format(args.txt_name)), "w")
+    f.write(f"Model: {args.model_names}\n")
+    f.write(f"Params: {total_params / 1e6:.2f}M\n")
+    f.write(f"FLOPs: {total_flops / 1e9:.2f}G\n")
+    f.write("--------------------------------------\n")
 
     for epoch in range(args.epoch):
         print("-----------------第{}轮训练开始-------------------".format(epoch + 1))
@@ -173,56 +231,62 @@ def train(model, optimizer, train_loader, test_loader, scheduler):
         train_losses, train_acces = train_one_epoch(
             model, optimizer, train_loader
         )
-        # 在测试集上评估模型性能，获取测试损失和准确度
-        test_losses, test_acces = evaluation(model, test_loader)
-        # 保存模型：如果当前测试准确度高于历史最佳准确度，更新最佳模型的数据
-        if test_acces > best_acc:
-            best_acc = test_acces
-            state_dict = dict(epoch=epoch + 1, model=model.state_dict(), acc=test_acces)
+        # 测试集评估（新增 Top-5 Acc）
+        test_losses, test_top1_acc = evaluation(model, test_loader, topk=(1, 5))
+        test_top1_acc, test_top5_acc = test_top1_acc[0], test_top1_acc[1]
+        # 更新test_top5_acc
+        if test_top5_acc > best_top5_acc:
+            best_top5_acc = test_top5_acc
+        # 保存最佳模型
+        if test_top1_acc > best_acc:
+            best_acc = test_top1_acc
+            state_dict = {
+                'epoch': epoch + 1,
+                'model': model.state_dict(),
+                'top1_acc': test_top1_acc,
+                'top5_acc': test_top5_acc,
+            }
             os.makedirs(os.path.dirname(best_model_path), exist_ok=True)
             torch.save(state_dict, best_model_path)
 
         scheduler.step()  # 更新学习率调度器
 
-        tags = ['train_losses',  # 定义要记录的训练信息的标签
-                'train_acces',
-                'test_losses',
-                'test_acces']
-        tb_writer.add_scalar(tags[0], train_losses, epoch + 1)  # 将训练信息写入TensorBoard
-        tb_writer.add_scalar(tags[1], train_acces, epoch + 1)
-        tb_writer.add_scalar(tags[2], test_losses, epoch + 1)
-        tb_writer.add_scalar(tags[3], test_acces, epoch + 1)
+        # 记录时间（ETA）
+        epoch_time = time.time() - since_epoch
+        remaining_time = epoch_time * (args.epoch - epoch - 1)
 
-        # 打印训练过程信息，以及将信息写入文件
-        if (epoch + 1) % args.print_freq == 0:  # print_freq指定为1 则每轮都打印
-            msg = "epoch:{} model:{} train loss:{:.2f} acc:{:.2f}  test loss{:.2f} acc:{:.2f}\n".format(
-                epoch + 1,
-                args.model_names,
-                train_losses,
-                train_acces,
-                test_losses,
-                test_acces,
-            )
-            print("第{}轮训练用时:{:.2f}s".format(epoch + 1, time.time() - since_epoch))
-            print('整体训练集上的loss:{:.4f}'.format(train_losses))
-            print('整体训练集上的正确率:{:.2f}%'.format(train_acces))
-            print('--------------------------------------')
-            print('整体测试集上的loss:{:.4f}'.format(test_losses))
-            print('整体测试集上的正确率:{:.2f}%'.format(test_acces))
-            f.write(msg)
-            f.flush()
-    # 输出训练结束后的最佳准确度和总训练时间
-    msg_best = "使用model:{} ,最优准确率:{:.2f}%\n".format(args.model_names, best_acc)
-    time_elapsed = "总耗时: {:.2f}s".format(time.time() - since)
-    print('---------------------------')
-    print(msg_best)
-    print(time_elapsed)
-    f.write(msg_best)
-    f.write(time_elapsed)
-    f.close()
+        # 打印信息
+        msg = (
+            f"训练轮次epoch= : {epoch + 1}\n"
+            f"train_loss: {train_losses:.4f}, train_top1_acc: {train_acces:.2f}%\n"
+            f"test_loss: {test_losses:.4f}, test_top1_acc: {test_top1_acc:.2f}%, test_top5_acc: {test_top5_acc:.2f}%\n"
+            f"epoch_time: {epoch_time:.2f}s, ETA: {remaining_time:.2f}s\n"
+            "--------------------------------------\n"
+        )
+        print(msg)
+        f.write(msg)
+        f.flush()
+
+        # TensorBoard 记录
+        tb_writer.add_scalar('train/loss', train_losses, epoch + 1)
+        tb_writer.add_scalar('train/top1_acc', train_acces, epoch + 1)
+        tb_writer.add_scalar('test/top1_acc', test_top1_acc, epoch + 1)
+        tb_writer.add_scalar('test/top5_acc', test_top5_acc, epoch + 1)
+
+        # 训练结束，输出最佳结果
+        msg_best = f"Best Top-1 Acc: {best_acc:.2f}%\n"
+        msg_top5_best = f"Best Top-5 Acc: {best_top5_acc:.2f}%\n"
+        total_time = time.time() - since
+        print('---------------------------')
+        print(msg_best)
+        print(msg_top5_best)
+        print(f'Total Time: {total_time:.2f}s')
+        f.write(msg_best)
+        f.write(f'Total Time: {total_time:.2f}s\n')
+        f.close()
 
 if __name__ == "__main__":
-    tb_path = "runs/{}/{}/{}".format(args.dataset, args.model_names,  # 创建 TensorBoard 日志目录路径
+    tb_path = "{}/{}/{}/{}".format(args.runs_path,args.dataset, args.model_names,  # 创建 TensorBoard 日志目录路径
                                      args.exp_postfix)
     tb_writer = SummaryWriter(log_dir=tb_path)
     lr = args.lr
@@ -241,6 +305,7 @@ if __name__ == "__main__":
     if torch.cuda.is_available():
         model = model.cuda()
         print('GPU名称:',torch.cuda.get_device_name(0),'\n')
+
     optimizer = optim.SGD(  # 创建随机梯度下降 (SGD) 优化器
         model.parameters(),
         lr=lr,
