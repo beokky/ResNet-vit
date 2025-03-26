@@ -66,18 +66,19 @@ def accuracy(output, target, topk=(1,)):
         return res
 
 parser = argparse.ArgumentParser() # 导入argparse模块，用于解析命令行参数
-parser.add_argument("--model_names", type=str, default="resnet18") # 添加命令行参数，指定模型名称，默认为"resnet18"
+parser.add_argument("--model_names", type=str, default="resnet18") # 添加命令行参数，指定模型名称
+parser.add_argument("--model_class", type=str, default="resnet") # 指定模型类型
 parser.add_argument("--pre_trained", type=bool, default=True) #指定是否使用预训练模型，默认为False
 parser.add_argument("--classes_num", type=int, default=120) # 指定类别数，默认为120
 parser.add_argument("--dataset", type=str, default="dataset") # 指定数据集名称，默认为"dataset"
 parser.add_argument("--batch_size", type=int, default=64) #   指定批量大小，默认为64
-parser.add_argument("--epoch", type=int, default=1) #  指定训练轮次数，默认为20
+parser.add_argument("--epoch", type=int, default=40) #  指定训练轮次数，默认为20
 parser.add_argument("--lr", type=float, default=0.01) #  指定学习率，默认为0.01
 parser.add_argument("--momentum", type=float, default=0.9)  # 优化器的动量，默认为 0.9
 parser.add_argument("--weight-decay", type=float, default=1e-4)  # 权重衰减（正则化项），默认为 5e-4
 parser.add_argument("--seed", type=int, default=33) # 指定随机种子，默认为33
 parser.add_argument("--gpu-id", type=int, default=0) # 指定GPU编号，默认为0
-parser.add_argument("--print_freq", type=int, default=1)  # 打印训练信息的频率，默认为 1（每个轮次打印一次）
+parser.add_argument("--print_freq", type=int, default=2)  # 打印训练信息的频率，默认为 1（每个轮次打印一次）
 parser.add_argument("--exp_postfix", type=str, default="logs")  # 实验结果文件夹的后缀，默认为 "logs"
 parser.add_argument("--txt_name", type=str, default="train_data")  # 记录训练过程文件名
 
@@ -202,6 +203,12 @@ def train(model, optimizer, train_loader, test_loader, scheduler):
     best_top5_acc=-1
     best_model_path = os.path.join(args.model_pth_path, args.model_names, "best.pth")
 
+    # 新增：早停参数
+    patience = 5  # 允许验证集性能不提升的轮次数
+    delta = 0.001  # 认为性能提升的最小变化量
+    early_stop_counter = 0  # 计数器
+    early_stop = False  # 早停标志
+
     # 新增：计算 FLOPs 和 Params
     if torch.cuda.is_available():
         dummy_input = torch.rand(1, 3, 224, 224).cuda()
@@ -225,6 +232,10 @@ def train(model, optimizer, train_loader, test_loader, scheduler):
     f.write("--------------------------------------\n")
 
     for epoch in range(args.epoch):
+        if early_stop:  # 检查是否触发早停
+            print(f"Early stopping at epoch {epoch + 1}!")
+            break
+
         print("-----------------第{}轮训练开始-------------------".format(epoch + 1))
         since_epoch = time.time()  # 记录每一轮训练开始时间
         # 在训练集上执行一个周期的训练，并获取训练损失和准确度
@@ -234,12 +245,14 @@ def train(model, optimizer, train_loader, test_loader, scheduler):
         # 测试集评估（新增 Top-5 Acc）
         test_losses, test_top1_acc = evaluation(model, test_loader, topk=(1, 5))
         test_top1_acc, test_top5_acc = test_top1_acc[0], test_top1_acc[1]
+
         # 更新test_top5_acc
         if test_top5_acc > best_top5_acc:
             best_top5_acc = test_top5_acc
         # 保存最佳模型
         if test_top1_acc > best_acc:
             best_acc = test_top1_acc
+            early_stop_counter = 0  # 重置计数器
             state_dict = {
                 'epoch': epoch + 1,
                 'model': model.state_dict(),
@@ -248,6 +261,10 @@ def train(model, optimizer, train_loader, test_loader, scheduler):
             }
             os.makedirs(os.path.dirname(best_model_path), exist_ok=True)
             torch.save(state_dict, best_model_path)
+        else:
+            early_stop_counter += 1  # 未提升，计数器+1
+            if early_stop_counter >= patience:
+                early_stop = True  # 触发早停
 
         scheduler.step()  # 更新学习率调度器
 
@@ -261,6 +278,7 @@ def train(model, optimizer, train_loader, test_loader, scheduler):
             f"train_loss: {train_losses:.4f}, train_top1_acc: {train_acces:.2f}%\n"
             f"test_loss: {test_losses:.4f}, test_top1_acc: {test_top1_acc:.2f}%, test_top5_acc: {test_top5_acc:.2f}%\n"
             f"epoch_time: {epoch_time:.2f}s, ETA: {remaining_time:.2f}s\n"
+            f"EarlyStop Counter: {early_stop_counter}/{patience}\n"  # 新增：显示早停计数器
             "--------------------------------------\n"
         )
         print(msg)
@@ -273,17 +291,17 @@ def train(model, optimizer, train_loader, test_loader, scheduler):
         tb_writer.add_scalar('test/top1_acc', test_top1_acc, epoch + 1)
         tb_writer.add_scalar('test/top5_acc', test_top5_acc, epoch + 1)
 
-        # 训练结束，输出最佳结果
-        msg_best = f"Best Top-1 Acc: {best_acc:.2f}%\n"
-        msg_top5_best = f"Best Top-5 Acc: {best_top5_acc:.2f}%\n"
-        total_time = time.time() - since
-        print('---------------------------')
-        print(msg_best)
-        print(msg_top5_best)
-        print(f'Total Time: {total_time:.2f}s')
-        f.write(msg_best)
-        f.write(f'Total Time: {total_time:.2f}s\n')
-        f.close()
+    # 训练结束，输出最佳结果
+    msg_best = f"Best Top-1 Acc: {best_acc:.2f}%\n"
+    msg_top5_best = f"Best Top-5 Acc: {best_top5_acc:.2f}%\n"
+    total_time = time.time() - since
+    print('---------------------------')
+    print(msg_best)
+    print(msg_top5_best)
+    print(f'Total Time: {total_time:.2f}s')
+    f.write(msg_best)
+    f.write(f'Total Time: {total_time:.2f}s\n')
+    f.close()
 
 if __name__ == "__main__":
     tb_path = "{}/{}/{}/{}".format(args.runs_path,args.dataset, args.model_names,  # 创建 TensorBoard 日志目录路径
@@ -293,12 +311,12 @@ if __name__ == "__main__":
 
 
     # 加载模型
-    # 加载resnet模型
-    if args.model_names=='resnet18':
-     model = model_dict[args.model_names](num_classes=args.classes_num, pretrained=args.pre_trained)  # 根据命令行参数创建神经网络模型
-    # 加载预训练的 ViT 模型
+    import timm
+    if args.model_class=='resnet':
+        # 加载 ResNet模型
+        model = timm.create_model(args.model_names, pretrained=args.pre_trained, num_classes=args.classes_num)
     else:
-        import timm
+        # 加载 ViT 模型
         model = timm.create_model(args.model_names, pretrained=args.pre_trained, num_classes=args.classes_num)
 
 
